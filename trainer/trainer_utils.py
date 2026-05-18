@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+import torch.nn as nn
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from model.model_minimind import MiniMindForCausalLM
@@ -43,7 +44,10 @@ def get_lr(current_step, total_steps, lr):
 
 def init_distributed_mode():
     if int(os.environ.get("RANK", -1)) == -1:
-        return 0  # 非DDP模式
+        Logger("  → 非 DDP 模式")
+        if torch.cuda.device_count() > 1:
+            Logger(f"  → 使用 DataParallel (单进程多卡，自动分配)")
+        return 0  # 非DDP模式,后续通过 DataParallel 实现多卡
 
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -60,6 +64,19 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+# 统一管理并行包装类型
+PARALLEL_WRAPPERS = (DistributedDataParallel, nn.DataParallel)
+
+
+def unwrap_model(model):
+    """安全解包 DDP 或 DataParallel 包装，返回原始模型。"""
+    while hasattr(model, 'module') and isinstance(model, PARALLEL_WRAPPERS):
+        model = model.module
+    # 兼容 torch.compile
+    model = getattr(model, '_orig_mod', model)
+    return model
+
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
@@ -67,8 +84,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
     resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
 
     if model is not None:
-        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-        raw_model = getattr(raw_model, '_orig_mod', raw_model)
+        raw_model = unwrap_model(model)
         state_dict = raw_model.state_dict()
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
         ckp_tmp = ckp_path + '.tmp'
@@ -93,8 +109,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         for key, value in kwargs.items():
             if value is not None:
                 if hasattr(value, 'state_dict'):
-                    raw_value = value.module if isinstance(value, DistributedDataParallel) else value
-                    raw_value = getattr(raw_value, '_orig_mod', raw_value)
+                    raw_value = unwrap_model(value)
                     resume_data[key] = raw_value.state_dict()
                 else:
                     resume_data[key] = value

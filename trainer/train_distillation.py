@@ -124,7 +124,7 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             model.eval()
             moe_suffix = '_moe' if lm_config_student.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config_student.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = model.module if isinstance(model, (DistributedDataParallel, torch.nn.DataParallel)) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
@@ -227,6 +227,9 @@ if __name__ == "__main__":
         Logger('torch.compile enabled')
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
+    elif torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+        Logger(f'使用 DataParallel 多卡训练，GPU 数量: {torch.cuda.device_count()}')
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):

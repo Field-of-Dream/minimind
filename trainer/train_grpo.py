@@ -93,7 +93,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
 
         rewards = calculate_rewards(prompts, completions, reward_model).to(args.device)  # [B*num_gen]
 
-        model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
+        model_unwrapped = model.module if isinstance(model, (DistributedDataParallel, torch.nn.DataParallel)) else model
         with autocast_ctx:
             res = model_unwrapped(outputs, attention_mask=full_mask)
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
@@ -180,7 +180,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = model.module if isinstance(model, (DistributedDataParallel, torch.nn.DataParallel)) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
@@ -312,6 +312,9 @@ if __name__ == "__main__":
         rollout_engine.update_policy(model)
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
+    elif torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+        Logger(f'使用 DataParallel 多卡训练，GPU 数量: {torch.cuda.device_count()}')
     rollout_engine.update_policy(model)
     
     # ========== 8. 开始训练 ==========

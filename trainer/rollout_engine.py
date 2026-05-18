@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 def compute_per_token_logps(model, input_ids: Tensor, n_keep: int, attention_mask: Optional[Tensor] = None) -> Tensor:
     if n_keep <= 0:
         return input_ids.new_empty((input_ids.size(0), 0), dtype=torch.float32)
-    unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
+    unwrapped = model.module if isinstance(model, (DistributedDataParallel, torch.nn.DataParallel)) else model
     input_ids = input_ids.detach().clone() if input_ids.is_inference() else input_ids
     logits = unwrapped(input_ids, attention_mask=attention_mask, logits_to_keep=n_keep + 1).logits[:, :-1, :]
     per_token_logps = []
@@ -69,7 +69,7 @@ class TorchRolloutEngine(RolloutEngine):
         self.autocast_ctx = autocast_ctx
     
     def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
-        model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
+        model = self.policy_model.module if isinstance(self.policy_model, (DistributedDataParallel, torch.nn.DataParallel)) else self.policy_model
         ctx = self.autocast_ctx if self.autocast_ctx else nullcontext()
         with torch.no_grad(), ctx:
             output_ids = model.generate(
@@ -176,7 +176,7 @@ class SGLangRolloutEngine(RolloutEngine):
         ok = True
         if not dist.is_initialized() or dist.get_rank() == 0:
             try:
-                unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
+                unwrapped = model.module if isinstance(model, (DistributedDataParallel, torch.nn.DataParallel)) else model
                 unwrapped = getattr(unwrapped, '_orig_mod', unwrapped)
                 abs_path = os.path.abspath(self.shared_ckpt_path)
                 state_dict = {k: v.detach().half().cpu() for k, v in unwrapped.state_dict().items()}

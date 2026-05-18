@@ -127,7 +127,7 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         resp_value_mask = resp_policy_mask.clone()
 
         with torch.no_grad():  # Rollout阶段只需推理获取old_logp和old_values，切断梯度省显存
-            critic_for_rollout = critic_model.module if isinstance(critic_model, DistributedDataParallel) else critic_model
+            critic_for_rollout = critic_model.module if isinstance(critic_model, (DistributedDataParallel, torch.nn.DataParallel)) else critic_model
             values_seq = critic_for_rollout(input_ids=gen_out, attention_mask=full_mask)
             old_resp_values = values_seq.gather(1, logp_pos) * resp_value_mask
             
@@ -158,8 +158,8 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         clipfrac_sum = 0.0
         aux_loss_sum = 0.0
         log_count = 0
-        actor_unwrapped = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
-        critic_unwrapped = critic_model.module if isinstance(critic_model, DistributedDataParallel) else critic_model
+        actor_unwrapped = actor_model.module if isinstance(actor_model, (DistributedDataParallel, torch.nn.DataParallel)) else actor_model
+        critic_unwrapped = critic_model.module if isinstance(critic_model, (DistributedDataParallel, torch.nn.DataParallel)) else critic_model
         for ppo_epoch in range(args.ppo_update_iters):
             if stop_ppo:
                 break
@@ -274,7 +274,7 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
             actor_model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_actor = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
+            raw_actor = actor_model.module if isinstance(actor_model, (DistributedDataParallel, torch.nn.DataParallel)) else actor_model
             raw_actor = getattr(raw_actor, '_orig_mod', raw_actor)
             actor_state = raw_actor.state_dict()
             torch.save({k: v.half().cpu() for k, v in actor_state.items()}, ckp)
@@ -415,6 +415,10 @@ if __name__ == "__main__":
     if dist.is_initialized():
         actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank])
         critic_model = DistributedDataParallel(critic_model, device_ids=[local_rank])
+    elif torch.cuda.device_count() > 1:
+        actor_model = torch.nn.DataParallel(actor_model)
+        critic_model = torch.nn.DataParallel(critic_model)
+        Logger(f'使用 DataParallel 多卡训练，GPU 数量: {torch.cuda.device_count()}')
     rollout_engine.update_policy(actor_model)
     
     # ========== 8. 开始训练 ==========

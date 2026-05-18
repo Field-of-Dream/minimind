@@ -165,6 +165,9 @@ if __name__ == "__main__":
         Logger('[LoRA] monkey-patch forward 与 torch.compile 不兼容，use_compile 已自动关闭')
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
+    elif torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+        Logger(f'使用 DataParallel 多卡训练，GPU 数量: {torch.cuda.device_count()}')
     
     # ========== 9. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
