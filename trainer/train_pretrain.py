@@ -8,6 +8,7 @@ import argparse
 import time
 import warnings
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from contextlib import nullcontext
 from torch import optim, nn
@@ -15,9 +16,31 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, gpu_supports_bf16
 
 warnings.filterwarnings('ignore')
+
+
+def compute_loss(model_out, labels_full):
+    """
+    统一 loss 计算，适用于所有并行模式：
+      - DataParallel: logits 已 gather → [B, L, V]，labels 是完整 batch → 直接算
+      - DDP:          logits 是本进程的 chunk → [B/D, L, V]，labels 同理 → 直接算
+      - 单卡:          logits [B, L, V]，labels [B, L] → 直接算
+    三种场景数学完全一致：F.cross_entropy(shifted_logits, shifted_labels)
+    """
+    logits = model_out.logits
+    x = logits[..., :-1, :].contiguous()
+    y = labels_full[..., 1:].contiguous()
+    loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+
+    # MoE auxiliary loss (如果有)
+    if model_out.aux_loss is not None:
+        aux = model_out.aux_loss
+        if aux.dim() > 0:   # DataParallel gather 拼成 vector [loss_gpu0, ...]
+            aux = aux.mean()
+        loss = loss + aux    # 保持与原代码一致: loss = res.loss + res.aux_loss
+    return loss
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
@@ -32,9 +55,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             param_group['lr'] = lr
 
         with autocast_ctx:
-            res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
-            loss = loss.mean()  # DataParallel 将各卡 scalar loss 拼成 vector，还原为 scalar
+            # 不传 labels 给 model: 让 logits 在 DataParallel/DDP 中自然流过，避免 scalar gather 问题
+            # loss 在 gather 之后统一计算（兼容 DP/DDP/单卡三种模式）
+            res = model(input_ids)
+            loss = compute_loss(res, labels)
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -51,7 +75,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
-            current_aux_loss = res.aux_loss.mean().item() if res.aux_loss is not None else 0.0
+            # 统一计算 aux_loss 日志值
+            aux_val = res.aux_loss
+            if aux_val is not None:
+                if aux_val.dim() > 0:
+                    aux_val = aux_val.mean()
+                current_aux_loss = aux_val.item()
+            else:
+                current_aux_loss = 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
@@ -123,8 +154,11 @@ if __name__ == "__main__":
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir=os.path.join(_REPO_ROOT, 'checkpoints')) if args.from_resume==1 else None
     
-    # ========== 3. 设置混合精度 ==========
+    # ========== 3. 设置混合精度（自动检测 GPU 能力） ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
+    if device_type == "cuda" and args.dtype == "bfloat16" and not gpu_supports_bf16(args.device):
+        Logger("  ⚠ 自动降级: bfloat16 → float16 (GPU 不支持 bfloat16，如 P100)")
+        args.dtype = "float16"
     if args.dtype == "float32":
         dtype = torch.float32
         autocast_ctx = nullcontext()

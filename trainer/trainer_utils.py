@@ -42,17 +42,96 @@ def get_lr(current_step, total_steps, lr):
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 
-def init_distributed_mode():
-    if int(os.environ.get("RANK", -1)) == -1:
-        Logger("  → 非 DDP 模式")
-        if torch.cuda.device_count() > 1:
-            Logger(f"  → 使用 DataParallel (单进程多卡，自动分配)")
-        return 0  # 非DDP模式,后续通过 DataParallel 实现多卡
+def gpu_supports_bf16(device='cuda'):
+    """检测当前 GPU 是否支持 bfloat16。（P100/Pascal 不支持，V100/T4+ 支持）"""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        cc = torch.cuda.get_device_capability(device)  # (major, minor)
+        # bfloat16 原生支持需要 CC 8.0+ (Ampere)；CC 7.0+ (Volta/Turing) 可通过软件转换
+        supports = cc >= (7, 0)
+        if not supports:
+            Logger(f"  → GPU (CC {cc[0]}.{cc[1]}) 不支持 bfloat16")
+        return supports
+    except Exception:
+        return False
 
+
+def init_distributed_mode():
+    """初始化分布式模式。
+    
+    返回: local_rank (int)
+      - DDP模式 (torchrun): 返回实际 local_rank
+      - 非DDP模式: 返回 0（由 DataParallel 处理多卡）
+    """
+    rank = int(os.environ.get("RANK", -1))
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    
+    if rank == -1:
+        n_gpu = torch.cuda.device_count()
+        Logger(f"  → 非 DDP 模式 (RANK 未设置)")
+        if n_gpu > 1:
+            Logger(f"  → 使用 DataParallel 多卡训练，GPU 数量: {n_gpu}")
+            Logger(f"  → GPU 列表: {[torch.cuda.get_device_name(i) for i in range(n_gpu)]}")
+        return 0
+    
+    # DDP mode
+    Logger(f"  → DDP 模式: rank={rank}, local_rank={local_rank}, world_size={world_size}")
     dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+    Logger(f"  → 使用 GPU: {torch.cuda.get_device_name(local_rank)}")
     return local_rank
+
+
+def get_multi_gpu_info():
+    """返回当前 GPU 拓扑和分布式状态信息（用于调试）"""
+    info = {
+        "available_gpus": torch.cuda.device_count(),
+        "cuda_available": torch.cuda.is_available(),
+        "ddp_active": dist.is_initialized(),
+    }
+    if dist.is_initialized():
+        info["world_size"] = dist.get_world_size()
+        info["rank"] = dist.get_rank()
+    info["gpu_names"] = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+    return info
+
+
+def validate_gradients(model, threshold=1e-8):
+    """验证模型梯度是否正常流动（返回 True/False + 诊断信息）
+    
+    用于 DataParallel 多卡训练时检查梯度是否正确同步。
+    如果某个参数的 grad_norm 为0或 NaN，说明梯度没有正确流回。
+    """
+    import math
+    total_params = 0
+    zero_grad = 0
+    nan_grad = 0
+    total_norm = 0.0
+    
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        total_params += 1
+        norm = param.grad.norm().item()
+        total_norm += norm ** 2
+        
+        if norm < threshold:
+            zero_grad += 1
+        if math.isnan(norm) or math.isinf(norm):
+            nan_grad += 1
+    
+    total_norm = total_norm ** 0.5
+    valid = (zero_grad < total_params * 0.5) and (nan_grad == 0) and (total_norm > 0)
+    
+    return valid, {
+        "total_norm": round(total_norm, 6),
+        "zero_grad_params": zero_grad,
+        "total_params": total_params,
+        "nan_grad_params": nan_grad,
+        "healthy": valid
+    }
 
 
 def setup_seed(seed: int):
