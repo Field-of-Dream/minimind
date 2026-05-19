@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, gpu_supports_bf16
 
 warnings.filterwarnings('ignore')
 
@@ -75,8 +75,16 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             reduction='none'
         )
         ce_loss_raw = torch.sum(ce_loss * loss_mask_flat) / (loss_mask_flat.sum() + 1e-8)
-        if lm_config_student.use_moe: ce_loss = ce_loss_raw + res.aux_loss
-        else: ce_loss = ce_loss_raw
+        if lm_config_student.use_moe:
+            aux = res.aux_loss
+            if aux is not None:
+                if aux.dim() > 0:   # DataParallel gather 拼成 vector
+                    aux = aux.mean()
+            else:
+                aux = torch.tensor(0.0, device=args.device)
+            ce_loss = ce_loss_raw + aux
+        else:
+            ce_loss = ce_loss_raw
 
         # 2) Distillation Loss
         if teacher_model is not None:
@@ -90,7 +98,6 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
 
         # 3) 总损失 = alpha * CE + (1-alpha) * Distill
         loss = (alpha * ce_loss + (1 - alpha) * distill_loss)
-        loss = loss.mean()  # DataParallel 将各卡 scalar loss 拼成 vector，还原为 scalar
         loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -153,7 +160,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
-    parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
+    parser.add_argument("--dtype", type=str, default="bfloat16", help="训练精度：bfloat16/float16/float32（设为float32可禁用混合精度）")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
@@ -188,10 +195,17 @@ if __name__ == "__main__":
     lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers, use_moe=bool(args.teacher_use_moe))
     ckp_data = lm_checkpoint(lm_config_student, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
-    # ========== 3. 设置混合精度 ==========
+    # ========== 3. 设置混合精度（自动检测 GPU 能力） ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+    if device_type == "cuda" and args.dtype == "bfloat16" and not gpu_supports_bf16(args.device):
+        Logger("  ⚠ 自动降级: bfloat16 → float16 (GPU 不支持 bfloat16，如 P100)")
+        args.dtype = "float16"
+    if args.dtype == "float32":
+        dtype = torch.float32
+        autocast_ctx = nullcontext()
+    else:
+        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+        autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. 配wandb ==========
     wandb = None

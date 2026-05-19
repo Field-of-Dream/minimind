@@ -8,6 +8,7 @@ import argparse
 import time
 import warnings
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from contextlib import nullcontext
 from torch import optim, nn
@@ -16,9 +17,22 @@ from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
 from model.model_lora import save_lora, apply_lora
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, gpu_supports_bf16
 
 warnings.filterwarnings('ignore')
+
+
+def compute_loss(model_out, labels_full):
+    logits = model_out.logits
+    x = logits[..., :-1, :].contiguous()
+    y = labels_full[..., 1:].contiguous()
+    loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+    if model_out.aux_loss is not None:
+        aux = model_out.aux_loss
+        if aux.dim() > 0:
+            aux = aux.mean()
+        loss = loss + aux
+    return loss
 
 
 def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
@@ -33,9 +47,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             param_group['lr'] = lr
 
         with autocast_ctx:
-            res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
-            loss = loss.mean()  # DataParallel 将各卡 scalar loss 拼成 vector，还原为 scalar
+            res = model(input_ids)
+            loss = compute_loss(res, labels)
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -50,7 +63,13 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
-            current_aux_loss = res.aux_loss.mean().item() if res.aux_loss is not None else 0.0
+            aux = res.aux_loss
+            if aux is not None:
+                if aux.dim() > 0:
+                    aux = aux.mean()
+                current_aux_loss = aux.item()
+            else:
+                current_aux_loss = 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
@@ -83,7 +102,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
-    parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
+    parser.add_argument("--dtype", type=str, default="bfloat16", help="训练精度：bfloat16/float16/float32（设为float32可禁用混合精度）")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
@@ -111,11 +130,18 @@ if __name__ == "__main__":
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.lora_name, save_dir='../checkpoints') if args.from_resume==1 else None
     
-    # ========== 3. 设置混合精度 ==========
+    # ========== 3. 设置混合精度（自动检测 GPU 能力） ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
+    if device_type == "cuda" and args.dtype == "bfloat16" and not gpu_supports_bf16(args.device):
+        Logger("  ⚠ 自动降级: bfloat16 → float16 (GPU 不支持 bfloat16，如 P100)")
+        args.dtype = "float16"
+    if args.dtype == "float32":
+        dtype = torch.float32
+        autocast_ctx = nullcontext()
+    else:
+        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+        autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+
     # ========== 4. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
