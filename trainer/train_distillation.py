@@ -89,7 +89,9 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             distill_loss = torch.tensor(0.0, device=args.device)
 
         # 3) 总损失 = alpha * CE + (1-alpha) * Distill
-        loss = (alpha * ce_loss + (1 - alpha) * distill_loss) / args.accumulation_steps
+        loss = (alpha * ce_loss + (1 - alpha) * distill_loss)
+        loss = loss.mean()  # DataParallel 将各卡 scalar loss 拼成 vector，还原为 scalar
+        loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 

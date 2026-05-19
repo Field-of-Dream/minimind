@@ -34,6 +34,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         with autocast_ctx:
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
+            loss = loss.mean()  # DataParallel 将各卡 scalar loss 拼成 vector，还原为 scalar
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()

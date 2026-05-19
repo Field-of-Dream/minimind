@@ -81,6 +81,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             
             dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
             loss = dpo_loss_val + outputs.aux_loss
+            loss = loss.mean()  # DataParallel 将各卡 scalar loss 拼成 vector，还原为 scalar
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
