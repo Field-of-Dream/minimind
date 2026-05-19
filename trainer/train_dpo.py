@@ -97,7 +97,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_dpo_loss = dpo_loss_val.item()
-            current_aux_loss = outputs.aux_loss.item()
+            current_aux_loss = outputs.aux_loss.mean().item()
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             

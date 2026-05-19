@@ -106,7 +106,7 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_ce_loss = ce_loss_raw.item()
-            current_aux_loss = res.aux_loss.item() if lm_config_student.use_moe else 0.0
+            current_aux_loss = res.aux_loss.mean().item() if lm_config_student.use_moe else 0.0
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             
